@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ultra-simple WebRTC Screen Share (shell)</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header>
+    <h1>Ultra-simple WebRTC Screen Share</h1>
+    <div class="small">Manual copy/paste OR optional WebSocket relay with a room code. Add your TURN to work across different ISPs/NATs. Now with <b>trickle ICE</b> and <b>local tab signaling</b>.</div>
+    <div id="buildInfo" class="small"></div>
+    <div id="sessionInfo" class="small"></div>
+  </header>
+
+  <div id="bootError" class="small error" style="padding:8px 16px; display:none;"></div>
+
+  <!-- 0) ICE / TURN config (works across different ISPs) -->
+  <section style="margin: 16px;">
+    <h2>0) ICE / TURN configuration</h2>
+    <div class="row">
+      <label class="small">STUN URLs (comma-separated)
+        <input id="stunUrls" type="text" style="min-width:360px" placeholder="stun:stun.l.google.com:19302" value="stun:stun.l.google.com:19302">
+      </label>
+    </div>
+    <div class="row">
+      <label class="small">TURN URLs (comma-separated)
+        <input id="turnUrls" type="text" style="min-width:360px" placeholder="turn:your.domain:3478, turns:your.domain:5349">
+      </label>
+      <label class="small">Username
+        <input id="turnUser" type="text" style="width:160px" placeholder="user">
+      </label>
+      <label class="small">Credential
+        <input id="turnPass" type="password" style="width:200px" placeholder="password">
+      </label>
+      <button id="btnApplyIce">Apply ICE config</button>
+      <span id="iceStatus" class="small"></span>
+    </div>
+    <div class="small">After applying, click <b>New Offer (ICE restart)</b> on Sender to force re-gathering with the new servers.</div>
+    <div class="row" style="margin-top:8px">
+      <label class="small"><input type="checkbox" id="chkDirectFirst" checked> Try <b>direct first</b> (no TURN initially), then fallback</label>
+      <label class="small">Fallback after <input id="fallbackSec" type="text" value="8" style="width:40px"> s</label>
+      <span id="directStatus" class="small"></span>
+    </div>
+    <div class="row small"><span id="pathStatus"></span></div>
+  </section>
+
+  <!-- 1) Optional Signaling Relay over WebSocket -->
+  <section style="margin: 16px;">
+    <h2>1) Optional: WebSocket Signaling (no copy/paste)</h2>
+    <div class="row">
+      <label class="small">WS URL <input id="sigUrl" type="text" style="min-width:320px" placeholder="wss://ws.example.com"></label>
+      <label class="small">Room <input id="roomId" type="text" placeholder="e.g. 973-512" style="width:120px"></label>
+      <button id="btnSigConnect">Connect</button>
+      <button id="btnSigDisconnect" disabled>Disconnect</button>
+      <span id="sigStatus" class="small"></span>
+    </div>
+    <div class="row">
+      <button id="btnMakeInvite">Generate Viewer link</button>
+      <button id="btnCopyInvite" disabled>Copy link</button>
+      <button id="btnOpenViewer">Open Viewer window</button>
+      <input id="inviteUrl" type="text" class="small" style="flex:1; min-width:360px" readonly placeholder="Invite link will appear here" />
+    </div>
+    <details>
+      <summary>How to run a tiny local relay server (Node.js)</summary>
+      <pre class="small">// save as signaling-server.js
+import { WebSocketServer } from 'ws';
+const wss = new WebSocketServer({ port: 8787 });
+const rooms = new Map(); // roomId -> Set(ws)
+
+function join(ws, room){
+  if (!rooms.has(room)) rooms.set(room, new Set());
+  rooms.get(room).add(ws);
+  ws.room = room;
+}
+
+wss.on('connection', ws => {
+  ws.on('message', raw => {
+    try {
+      const msg = JSON.parse(raw.toString());
+      if (msg.type === 'join' && msg.room){ join(ws, msg.room); return; }
+      if (!ws.room) return;
+      // fan-out to others in the same room
+      const peers = rooms.get(ws.room) || new Set();
+      for (const peer of peers){ if (peer !== ws && peer.readyState === 1) peer.send(JSON.stringify(msg)); }
+    } catch (e) {}
+  });
+  ws.on('close', () => {
+    if (ws.room && rooms.has(ws.room)) rooms.get(ws.room).delete(ws);
+  });
+});
+console.log('WS relay on ws://0.0.0.0:8787');
+
+// Run:
+//   npm init -y
+//   npm i ws
+//   node signaling-server.js</pre>
+    </details>
+  </section>
+
+  <main>
+    <!-- SENDER side -->
+    <section>
+      <h2>2) Sender (on the laptop that shares a window)</h2>
+      <div class="row">
+        <button id="btnShare">Share a window…</button>
+        <label class="small"><input id="chkWithAudio" type="checkbox"> try system audio</label>
+        <button id="btnEnv">Run checks</button>
+        <span id="shareStatus" class="small"></span>
+      </div>
+      <video id="localVideo" playsinline muted></video>
+      <div class="row" style="margin-top:8px">
+        <button id="btnCreateOffer" disabled>Create Offer (SDP)</button>
+        <button id="btnIceRestart" disabled>New Offer (ICE restart)</button>
+        <span id="offerStatus" class="small"></span>
+      </div>
+      <textarea id="offerOut" placeholder="Local Offer SDP (trickle) will appear here immediately and update as candidates arrive."></textarea>
+      <div class="row">
+        <button id="btnSetAnswer" disabled>Paste Viewer Answer → Set Remote Description</button>
+        <span id="answerStatus" class="small"></span>
+      </div>
+      <textarea id="answerIn" placeholder="Paste Answer SDP from the Viewer here, then click the button above."></textarea>
+      <details>
+        <summary>Advanced (reset / stats / env)</summary>
+        <div class="row" style="margin:6px 0">
+          <button id="btnSenderReset">Reset PeerConnection</button>
+          <button id="btnSenderStats">Log Stats</button>
+        </div>
+        <div class="row small">
+          <span id="sigState"></span>
+          <span id="iceState"></span>
+          <span id="connState"></span>
+        </div>
+        <pre id="senderLog" class="small"></pre>
+        <pre id="envInfo" class="small"></pre>
+      </details>
+    </section>
+
+    <!-- VIEWER side -->
+    <section>
+      <h2>3) Viewer (on the PC that watches)</h2>
+      <div class="row">
+        <button id="btnAcceptOffer" disabled>Paste Sender Offer → Create Answer</button>
+        <span id="viewerStatus" class="small"></span>
+      </div>
+      <textarea id="offerIn" placeholder="Paste Offer SDP from the Sender here, then click the button above."></textarea>
+      <div class="row">
+        <button id="btnCopyAnswer" disabled>Copy Answer SDP for Sender</button>
+      </div>
+      <textarea id="answerOut" placeholder="Answer SDP will appear here. Copy this back to the Sender."></textarea>
+      <video id="remoteVideo" playsinline autoplay muted></video>
+      <details>
+        <summary>Advanced (reset / stats)</summary>
+        <div class="row" style="margin:6px 0">
+          <button id="btnViewerReset">Reset PeerConnection</button>
+          <button id="btnViewerStats">Log Stats</button>
+        </div>
+        <pre id="viewerLog" class="small"></pre>
+      </details>
+    </section>
+  </main>
+
+  <section style="margin: 0 16px 16px">
+    <h2>4) Self-tests</h2>
+    <div class="row">
+      <button id="btnRunTests">Run self-tests</button>
+      <span id="testStatus" class="small"></span>
+    </div>
+    <pre id="testLog" class="small"></pre>
+  </section>
+
+  <footer style="padding:12px 16px" class="small">
+    Tips: use over <code>https://</code> or <code>http://localhost</code>. To cross ISPs you usually need a <b>TURN</b> server. See ICE section above.
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>
